@@ -1,26 +1,20 @@
 """
-investigate_cuckoo.py - figure out HOW the Farm Manager client reaches the
-server, so we can route our own write requests the same way.
+investigate_cuckoo.py - find the Bambu client cert and test the write route.
 
-Background: a direct Python request to https://192.168.68.78:8888 fails mutual
-TLS (the server demands a client cert we don't have).  The client instead
-makes PLAIN http://192.168.68.78:8888 requests that Electron intercepts and
-routes through a local "cuckoo" proxy, which performs the real mTLS HTTPS to
-the server.  To write, we must send our requests through that same proxy.
+Background: there is no separate cuckoo proxy process.  The cert attachment
+happens inside Electron's net module using the Windows certificate store
+(non-exportable key).  We therefore cannot route through a proxy port.
 
-What this script does:
-  [1] Passively inspects a real :8888 request the client makes (via DevTools).
-  [2] Lists local TCP listeners and maps each to its owning process.
-  [3] ACTIVELY probes each local port with a read-only GET /captain, routed
-      through that port as an HTTP proxy (and also tried directly), to find
-      which port is cuckoo.  /captain is the server health endpoint - safe.
+The reliable alternative: PowerShell Invoke-RestMethod uses .NET/WinHTTP,
+which can pick a cert from the Windows store by thumbprint — including keys
+marked non-exportable.  This script finds the right cert and confirms the
+route works with a read-only GET /captain.
 
-Run it on the Windows box with the client open on the Printers page:
+Run on the Windows box with the client open:
     python investigate_cuckoo.py
 """
 
 import json
-import re
 import subprocess
 import sys
 import time
@@ -30,41 +24,61 @@ from bambu_client import ensure_client, get_page_ws
 try:
     import websocket
 except ImportError:
-    print("Installing websocket-client ...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "websocket-client"])
     import websocket
 
-try:
-    import requests
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-except ImportError:
-    print("Installing requests ...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
-    import requests
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-API_HOST_HINT = "192.168.68.78"          # the server we ultimately want to reach
-API_HTTP = "http://192.168.68.78:8888"   # how the client addresses it
-PROBE_PATH = "/captain"                  # read-only health endpoint
+API_URL = "https://192.168.68.78:8888"
+PROBE_PATH = "/captain"
 
 
 # ---------------------------------------------------------------------------
-# 1. Inspect a real API request via DevTools
+# 1. List certs in CurrentUser\My via PowerShell
 # ---------------------------------------------------------------------------
 
-def inspect_api_request(timeout: int = 40) -> dict | None:
+def list_user_certs() -> list[dict]:
+    ps = r"""
+    Get-ChildItem Cert:\CurrentUser\My | ForEach-Object {
+        [PSCustomObject]@{
+            Thumbprint = $_.Thumbprint
+            Subject    = $_.Subject
+            Issuer     = $_.Issuer
+            NotAfter   = $_.NotAfter.ToString("yyyy-MM-dd")
+            HasPrivKey = $_.HasPrivateKey
+        }
+    } | ConvertTo-Json -Compress
     """
-    Capture the first response to an :8888 API call the client makes and
-    return its connection details (remote IP/port, protocol, headers, url).
-    """
+    try:
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command", ps],
+            text=True, stderr=subprocess.DEVNULL)
+        data = json.loads(out.strip())
+        if isinstance(data, dict):
+            data = [data]
+        return data
+    except Exception as e:
+        print(f"  (cert enumeration failed: {e})")
+        return []
+
+
+def find_bambu_certs(certs: list[dict]) -> list[dict]:
+    hits = []
+    for c in certs:
+        sub = (c.get("Subject") or "").lower()
+        iss = (c.get("Issuer") or "").lower()
+        if any(kw in sub or kw in iss for kw in ("bambu", "bbl", "farm")):
+            hits.append(c)
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# 2. Sniff JWT from DevTools (reuse bambu_api logic)
+# ---------------------------------------------------------------------------
+
+def sniff_jwt(timeout: int = 40) -> str | None:
     ensure_client(verbose=False)
     ws_url = get_page_ws()
     if not ws_url:
-        print("Could not get a DevTools page websocket. Is the client open?")
         return None
-
     ws = websocket.create_connection(ws_url, max_size=None)
     mid = [0]
 
@@ -75,141 +89,56 @@ def inspect_api_request(timeout: int = 40) -> dict | None:
     send("Network.enable")
     ws.settimeout(timeout + 2)
     deadline = time.time() + timeout
-    found = None
-
+    token = None
     try:
-        while time.time() < deadline and found is None:
+        while time.time() < deadline and token is None:
             try:
                 msg = json.loads(ws.recv())
             except Exception:
                 break
-            if msg.get("method") != "Network.responseReceived":
-                continue
-            resp = msg["params"]["response"]
-            url = resp.get("url", "")
-            if ":8888" in url or API_HOST_HINT in url:
-                found = {
-                    "url": url,
-                    "scheme": url.split(":", 1)[0],
-                    "remoteIPAddress": resp.get("remoteIPAddress"),
-                    "remotePort": resp.get("remotePort"),
-                    "protocol": resp.get("protocol"),
-                    "fromProxy": resp.get("fromProxy"),
-                    "requestHeaders": resp.get("requestHeaders", {}),
-                }
+            for event in ("Network.requestWillBeSent", "Network.responseReceived"):
+                if msg.get("method") != event:
+                    continue
+                if event == "Network.requestWillBeSent":
+                    hdrs = msg.get("params", {}).get("request", {}).get("headers", {})
+                else:
+                    hdrs = msg.get("params", {}).get("response", {}).get("requestHeaders", {})
+                auth = hdrs.get("Authorization") or hdrs.get("authorization", "")
+                if auth.startswith("Bearer "):
+                    token = auth[len("Bearer "):]
     finally:
         ws.close()
-
-    return found
+    return token
 
 
 # ---------------------------------------------------------------------------
-# 2. Enumerate local listeners + map to processes (Windows)
+# 3. Test the PowerShell Invoke-RestMethod route
 # ---------------------------------------------------------------------------
 
-def name_for_pid(pid: str) -> str:
+def ps_get(url: str, thumbprint: str, jwt: str | None) -> str:
+    auth_header = ""
+    if jwt:
+        auth_header = f"'Authorization' = 'Bearer {jwt}'; "
+    ps = f"""
+    $cert = Get-Item 'Cert:\\CurrentUser\\My\\{thumbprint}'
+    $headers = @{{ {auth_header}'x-bbl-sec-ver' = '1' }}
+    try {{
+        $r = Invoke-RestMethod -Uri '{url}' -Certificate $cert `
+             -Headers $headers -SkipCertificateCheck -Method GET
+        $r | ConvertTo-Json -Depth 5 -Compress
+    }} catch {{
+        Write-Output "ERROR: $($_.Exception.Message)"
+    }}
+    """
     try:
         out = subprocess.check_output(
-            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-            text=True, stderr=subprocess.DEVNULL)
-        parts = out.strip().split('","')
-        if parts and parts[0]:
-            return parts[0].strip('"')
-    except Exception:
-        pass
-    return "?"
-
-
-def local_listeners() -> list[tuple[str, str, str]]:
-    """Return [(port, pid, process_name), ...] for 127.0.0.1 TCP listeners."""
-    try:
-        out = subprocess.check_output(
-            ["netstat", "-ano", "-p", "TCP"], text=True, stderr=subprocess.DEVNULL)
+            ["powershell", "-NoProfile", "-Command", ps],
+            text=True, stderr=subprocess.STDOUT, timeout=15)
+        return out.strip()
+    except subprocess.TimeoutExpired:
+        return "TIMEOUT"
     except Exception as e:
-        print(f"  (netstat failed: {e})")
-        return []
-    rows = []
-    seen = set()
-    for ln in out.splitlines():
-        if "LISTENING" not in ln or "127.0.0.1" not in ln:
-            continue
-        m = re.search(r"127\.0\.0\.1:(\d+)\s+\S+\s+LISTENING\s+(\d+)", ln)
-        if not m:
-            continue
-        port, pid = m.group(1), m.group(2)
-        if port in seen:
-            continue
-        seen.add(port)
-        rows.append((port, pid, name_for_pid(pid)))
-    return rows
-
-
-# ---------------------------------------------------------------------------
-# 3. Actively probe candidate ports for the cuckoo route
-# ---------------------------------------------------------------------------
-
-def _auth_headers() -> dict:
-    """Best-effort JWT for the probe (/captain may not need it, but be safe)."""
-    headers = {"x-bbl-sec-ver": "1"}
-    try:
-        from bambu_api import _get_jwt
-        headers["Authorization"] = f"Bearer {_get_jwt()}"
-    except Exception as e:
-        print(f"  (could not sniff a JWT for the probe: {e})")
-    return headers
-
-
-def _summarise(resp) -> str:
-    body = (resp.text or "")[:160].replace("\n", " ")
-    return f"HTTP {resp.status_code}  body[:160]={body!r}"
-
-
-def probe_ports(ports: list[str]) -> str | None:
-    """
-    For each candidate port, try reaching GET {API_HTTP}{PROBE_PATH} two ways:
-      a) using the port as an HTTP forward proxy
-      b) talking to the port directly (reverse-proxy style)
-    Return the first port that yields a healthy response, else None.
-    """
-    headers = _auth_headers()
-    winner = None
-
-    print(f"\n    Target: GET {API_HTTP}{PROBE_PATH}")
-    print("    (a) = port used as HTTP proxy   (b) = direct to 127.0.0.1:port\n")
-
-    for port in ports:
-        proxies = {"http": f"http://127.0.0.1:{port}",
-                   "https": f"http://127.0.0.1:{port}"}
-        # (a) as a forward proxy
-        try:
-            r = requests.get(f"{API_HTTP}{PROBE_PATH}", headers=headers,
-                             proxies=proxies, timeout=6, verify=False)
-            print(f"    port {port} (a) proxy : {_summarise(r)}")
-            if r.ok and r.text.strip().startswith(("{", "[")):
-                winner = winner or ("proxy", port)
-        except Exception as e:
-            print(f"    port {port} (a) proxy : {type(e).__name__}: {str(e)[:80]}")
-        # (b) direct to the port
-        try:
-            r = requests.get(f"http://127.0.0.1:{port}{PROBE_PATH}", headers=headers,
-                             timeout=6, verify=False)
-            print(f"    port {port} (b) direct: {_summarise(r)}")
-            if r.ok and r.text.strip().startswith(("{", "[")):
-                winner = winner or ("direct", port)
-        except Exception as e:
-            print(f"    port {port} (b) direct: {type(e).__name__}: {str(e)[:80]}")
-
-    # also a baseline: plain http straight to the server (no proxy)
-    try:
-        r = requests.get(f"{API_HTTP}{PROBE_PATH}", headers=headers,
-                         timeout=6, verify=False)
-        print(f"\n    baseline no-proxy http: {_summarise(r)}")
-        if r.ok and r.text.strip().startswith(("{", "[")):
-            winner = winner or ("noproxy-http", "-")
-    except Exception as e:
-        print(f"\n    baseline no-proxy http: {type(e).__name__}: {str(e)[:80]}")
-
-    return winner
+        return f"subprocess error: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -218,66 +147,63 @@ def probe_ports(ports: list[str]) -> str | None:
 
 def main():
     print("=" * 70)
-    print("CUCKOO INVESTIGATION")
+    print("CUCKOO INVESTIGATION  (round 3 — PowerShell / cert store)")
     print("=" * 70)
 
-    print("\n[1] Inspecting a real API request the client makes ...")
-    info = inspect_api_request()
-    if not info:
-        print("    No :8888 API request observed. Make sure the client is open")
-        print("    on the Printers page (it polls every ~30s). Stopping.")
-        return
-    print(f"    url            : {info['url']}")
-    print(f"    scheme         : {info['scheme']}")
-    print(f"    remoteIPAddress: {info['remoteIPAddress']}")
-    print(f"    remotePort     : {info['remotePort']}")
-    print(f"    protocol       : {info['protocol']}")
-    print(f"    fromProxy      : {info['fromProxy']}")
+    print("\n[1] Certificates in CurrentUser\\My:")
+    certs = list_user_certs()
+    if not certs:
+        print("    (none found or PowerShell failed)")
+    for c in certs:
+        flag = "  <-- BAMBU?" if c in find_bambu_certs(certs) else ""
+        print(f"    {c['Thumbprint'][:16]}...  {c['Subject'][:55]}  exp {c['NotAfter']}{flag}")
 
-    print("\n[2] Local TCP listeners on 127.0.0.1:")
-    listeners = local_listeners()
-    for port, pid, name in listeners:
-        print(f"    127.0.0.1:{port:<6}  pid {pid:<6}  {name}")
+    bambu_certs = find_bambu_certs(certs)
+    if not bambu_certs and certs:
+        print("\n    No cert with 'bambu/bbl/farm' in subject/issuer.")
+        print("    Will test ALL certs with a private key.")
+        candidates = [c for c in certs if c.get("HasPrivKey")]
+    else:
+        candidates = bambu_certs
 
-    print("\n[3] Probing candidate ports for the cuckoo route ...")
-    ports = [p for p, _, _ in listeners if p != "9222"]  # skip the debug port
-    winner = probe_ports(ports)
+    print(f"\n[2] Sniffing JWT from client ...")
+    jwt = sniff_jwt()
+    print(f"    JWT sniffed: {'yes (' + jwt[:20] + '...)' if jwt else 'no (timed out)'}")
+
+    print(f"\n[3] Testing PowerShell route with {len(candidates)} candidate cert(s) ...")
+    url = f"{API_URL}{PROBE_PATH}"
+    winner = None
+    for c in candidates:
+        thumb = c["Thumbprint"]
+        print(f"\n    cert: {thumb[:16]}...  {c['Subject'][:55]}")
+        result = ps_get(url, thumb, jwt)
+        print(f"    result: {result[:200]}")
+        if result and "ERROR" not in result and "TIMEOUT" not in result and "error" not in result.lower():
+            winner = (thumb, c["Subject"])
 
     print("\n" + "=" * 70)
     print("CONCLUSION")
     print("=" * 70)
     if winner:
-        mode, port = winner
-        if mode == "proxy":
-            print(f"""
-    Cuckoo is the HTTP proxy on 127.0.0.1:{port}.
-    Set this at the top of bambu_api.py and writes will work:
+        thumb, subject = winner
+        print(f"""
+    PowerShell route WORKS with cert thumbprint:
+        {thumb}  ({subject})
 
-        CUCKOO_PROXY = {{"http":  "http://127.0.0.1:{port}",
-                        "https": "http://127.0.0.1:{port}"}}
-        BASE_URL = "http://192.168.68.78:8888"   # note: http, like the client
-""")
-        elif mode == "direct":
-            print(f"""
-    The server is reachable directly at 127.0.0.1:{port} (reverse proxy).
-    Set this at the top of bambu_api.py:
-
-        BASE_URL = "http://127.0.0.1:{port}"
-        CUCKOO_PROXY = None
-""")
-        else:  # noproxy-http
-            print(f"""
-    Plain HTTP straight to {API_HTTP} works (no proxy needed)!
-    Set at the top of bambu_api.py:
-
-        BASE_URL = "http://192.168.68.78:8888"   # http, not https
-        CUCKOO_PROXY = None
+    This is the transport to use in bambu_api.py.
+    Copy the thumbprint above and report back — the code will be updated.
 """)
     else:
         print("""
-    None of the probed ports returned a healthy /captain.  Paste this whole
-    output back and we'll pick the next approach (Windows curl via cert
-    thumbprint, or driving the client through DevTools).
+    PowerShell route did not succeed with any cert.
+
+    Possible next steps:
+      a) The Bambu cert is in LocalMachine\\My rather than CurrentUser\\My.
+         Re-run: Set-Location Cert:\\LocalMachine\\My and check.
+      b) The cert subject uses different keywords than bambu/bbl/farm.
+      c) Try driving the client via DevTools (Runtime.evaluate in main process).
+
+    Paste this full output back to proceed.
 """)
 
 
