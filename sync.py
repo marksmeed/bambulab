@@ -29,6 +29,15 @@ DB_PATH = "farm.db"
 DEVICES_INTERVAL = 15       # seconds
 MODELS_INTERVAL = 600       # seconds (10 min)
 
+# The Farm Manager client polls /devices2 on its own cycle (~30 s).  We need
+# to wait long enough to catch at least one cycle after connecting.
+DEVICES_CAPTURE_TIMEOUT = 35   # seconds
+
+# /file/f3mffolder is only requested when the user navigates to the Files
+# section of the UI.  We wait up to this long and prompt the user to click
+# there if it isn't captured quickly.
+MODELS_CAPTURE_TIMEOUT = 60    # seconds
+
 
 # ---------------------------------------------------------------------------
 # Generic DevTools capture helper
@@ -87,9 +96,10 @@ def _capture_url(url_fragment: str, timeout: int = 20) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def sync_devices_once() -> bool:
-    data = _capture_url("/devices2")
+    data = _capture_url("/devices2", timeout=DEVICES_CAPTURE_TIMEOUT)
     if not data:
-        print(f"[{_ts()}] sync_devices: no data captured")
+        print(f"[{_ts()}] sync_devices: no data captured "
+              f"(waited {DEVICES_CAPTURE_TIMEOUT}s — is the client on the Printers page?)")
         return False
     parse_and_sync(data, path=DB_PATH)
     device_count = len(data.get("devices", []))
@@ -116,9 +126,12 @@ def upsert_model(con: sqlite3.Connection, f3mf_id: str, name: str, folder_id: st
 
 
 def sync_models_once() -> bool:
-    folders_data = _capture_url("/file/f3mffolder")
+    print(f"[{_ts()}] sync_models: waiting up to {MODELS_CAPTURE_TIMEOUT}s for "
+          f"/file/f3mffolder — navigate to the Files section in the Farm Manager UI now ...")
+    folders_data = _capture_url("/file/f3mffolder", timeout=MODELS_CAPTURE_TIMEOUT)
     if not folders_data:
-        print(f"[{_ts()}] sync_models: could not capture /file/f3mffolder")
+        print(f"[{_ts()}] sync_models: timed out — no /file/f3mffolder request observed. "
+              f"Open the Files tab in the Farm Manager client and re-run.")
         return False
 
     folders = folders_data if isinstance(folders_data, list) else folders_data.get("folders", [])
