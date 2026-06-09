@@ -15,9 +15,26 @@ Usage:
 """
 
 import argparse
+import importlib
 import sqlite3
+import subprocess
+import sys
 import time
 from pathlib import Path
+
+
+def _ensure_deps():
+    # package name -> import name (where they differ)
+    deps = {"requests": "requests", "urllib3": "urllib3"}
+    for pkg, imp in deps.items():
+        try:
+            importlib.import_module(imp)
+        except ImportError:
+            print(f"Installing {pkg} ...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+
+
+_ensure_deps()
 
 import requests
 import urllib3

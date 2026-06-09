@@ -13,9 +13,25 @@ Usage:
     python bambu_api.py --opt <dev_id> <opt_name>
 """
 
+import importlib
 import json
+import subprocess
 import sys
 import time
+
+
+def _ensure_deps():
+    # package name -> import name (where they differ)
+    deps = {"requests": "requests", "urllib3": "urllib3", "websocket-client": "websocket"}
+    for pkg, imp in deps.items():
+        try:
+            importlib.import_module(imp)
+        except ImportError:
+            print(f"Installing {pkg} ...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+
+
+_ensure_deps()
 
 import requests
 import urllib3
