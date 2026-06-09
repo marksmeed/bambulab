@@ -27,7 +27,7 @@ data "aws_ami" "cloudlinux" {
 
   filter {
     name   = "name"
-    values = ["cloudlinux-8*-amd64.nopanel*"]
+    values = ["cloudlinux-10*-amd64.nopanel*"]
   }
 
   filter {
