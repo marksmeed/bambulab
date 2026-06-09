@@ -1,14 +1,17 @@
 """
-investigate_cuckoo.py - find the Bambu client cert and test the write route.
+investigate_cuckoo.py - test whether the server just needs https + JWT,
+or whether it genuinely requires a client certificate.
 
-Background: there is no separate cuckoo proxy process.  The cert attachment
-happens inside Electron's net module using the Windows certificate store
-(non-exportable key).  We therefore cannot route through a proxy port.
+The baseline `http://` probe returned HTTP 400 "Client sent an HTTP request
+to an HTTPS server" — meaning the server accepted our TCP connection and
+responded.  This suggests it may not be enforcing mutual TLS after all, and
+the earlier CERTIFICATE_REQUIRED error was simply us trying the wrong scheme.
 
-The reliable alternative: PowerShell Invoke-RestMethod uses .NET/WinHTTP,
-which can pick a cert from the Windows store by thumbprint — including keys
-marked non-exportable.  This script finds the right cert and confirms the
-route works with a read-only GET /captain.
+This script:
+  [1] Sniffs a JWT from the running client.
+  [2] Tests GET /captain with https + verify=False + JWT (the simplest route).
+  [3] If that fails, tries PowerShell Invoke-RestMethod with each cert in
+      CurrentUser\\My as a fallback.
 
 Run on the Windows box with the client open:
     python investigate_cuckoo.py
@@ -27,51 +30,22 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "websocket-client"])
     import websocket
 
-API_URL = "https://192.168.68.78:8888"
+try:
+    import requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
+    import requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+API_BASE = "https://192.168.68.78:8888"
 PROBE_PATH = "/captain"
 
 
 # ---------------------------------------------------------------------------
-# 1. List certs in CurrentUser\My via PowerShell
-# ---------------------------------------------------------------------------
-
-def list_user_certs() -> list[dict]:
-    ps = r"""
-    Get-ChildItem Cert:\CurrentUser\My | ForEach-Object {
-        [PSCustomObject]@{
-            Thumbprint = $_.Thumbprint
-            Subject    = $_.Subject
-            Issuer     = $_.Issuer
-            NotAfter   = $_.NotAfter.ToString("yyyy-MM-dd")
-            HasPrivKey = $_.HasPrivateKey
-        }
-    } | ConvertTo-Json -Compress
-    """
-    try:
-        out = subprocess.check_output(
-            ["powershell", "-NoProfile", "-Command", ps],
-            text=True, stderr=subprocess.DEVNULL)
-        data = json.loads(out.strip())
-        if isinstance(data, dict):
-            data = [data]
-        return data
-    except Exception as e:
-        print(f"  (cert enumeration failed: {e})")
-        return []
-
-
-def find_bambu_certs(certs: list[dict]) -> list[dict]:
-    hits = []
-    for c in certs:
-        sub = (c.get("Subject") or "").lower()
-        iss = (c.get("Issuer") or "").lower()
-        if any(kw in sub or kw in iss for kw in ("bambu", "bbl", "farm")):
-            hits.append(c)
-    return hits
-
-
-# ---------------------------------------------------------------------------
-# 2. Sniff JWT from DevTools (reuse bambu_api logic)
+# Sniff JWT
 # ---------------------------------------------------------------------------
 
 def sniff_jwt(timeout: int = 40) -> str | None:
@@ -112,16 +86,56 @@ def sniff_jwt(timeout: int = 40) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# 3. Test the PowerShell Invoke-RestMethod route
+# Test 1: plain https + verify=False + JWT
 # ---------------------------------------------------------------------------
 
-def ps_get(url: str, thumbprint: str, jwt: str | None) -> str:
-    auth_header = ""
+def test_https_direct(jwt: str | None) -> tuple[bool, str]:
+    headers = {"x-bbl-sec-ver": "1"}
     if jwt:
-        auth_header = f"'Authorization' = 'Bearer {jwt}'; "
+        headers["Authorization"] = f"Bearer {jwt}"
+    url = f"{API_BASE}{PROBE_PATH}"
+    try:
+        r = requests.get(url, headers=headers, verify=False, timeout=10)
+        summary = f"HTTP {r.status_code}  body[:200]={r.text[:200]!r}"
+        return r.ok, summary
+    except requests.exceptions.SSLError as e:
+        return False, f"SSLError: {e}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Test 2: PowerShell Invoke-RestMethod with cert from store
+# ---------------------------------------------------------------------------
+
+def list_user_certs() -> list[dict]:
+    ps = r"""
+    Get-ChildItem Cert:\CurrentUser\My | ForEach-Object {
+        [PSCustomObject]@{
+            Thumbprint = $_.Thumbprint
+            Subject    = $_.Subject
+            Issuer     = $_.Issuer
+            NotAfter   = $_.NotAfter.ToString("yyyy-MM-dd")
+            HasPrivKey = $_.HasPrivateKey
+        }
+    } | ConvertTo-Json -Compress
+    """
+    try:
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command", ps],
+            text=True, stderr=subprocess.DEVNULL)
+        data = json.loads(out.strip())
+        return [data] if isinstance(data, dict) else data
+    except Exception as e:
+        print(f"  (cert enumeration failed: {e})")
+        return []
+
+
+def ps_get(url: str, thumbprint: str, jwt: str | None) -> str:
+    auth_line = f"'Authorization' = 'Bearer {jwt}'; " if jwt else ""
     ps = f"""
     $cert = Get-Item 'Cert:\\CurrentUser\\My\\{thumbprint}'
-    $headers = @{{ {auth_header}'x-bbl-sec-ver' = '1' }}
+    $headers = @{{ {auth_line}'x-bbl-sec-ver' = '1' }}
     try {{
         $r = Invoke-RestMethod -Uri '{url}' -Certificate $cert `
              -Headers $headers -SkipCertificateCheck -Method GET
@@ -142,68 +156,83 @@ def ps_get(url: str, thumbprint: str, jwt: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Report
+# Main
 # ---------------------------------------------------------------------------
 
 def main():
     print("=" * 70)
-    print("CUCKOO INVESTIGATION  (round 3 — PowerShell / cert store)")
+    print("TRANSPORT TEST")
     print("=" * 70)
 
-    print("\n[1] Certificates in CurrentUser\\My:")
+    print(f"\n[1] Sniffing JWT (up to 40s — client must be polling) ...")
+    jwt = sniff_jwt()
+    if jwt:
+        print(f"    Got JWT: {jwt[:30]}...")
+    else:
+        print("    No JWT captured — tests will run without auth (may get 401).")
+
+    print(f"\n[2] Test: https + verify=False + JWT  ->  GET {API_BASE}{PROBE_PATH}")
+    ok, summary = test_https_direct(jwt)
+    print(f"    {summary}")
+
+    if ok:
+        print("""
+======================================================================
+RESULT: DIRECT HTTPS WORKS
+======================================================================
+The server does NOT require mutual TLS — https + verify=False + JWT is
+sufficient.  The earlier CERTIFICATE_REQUIRED error was a red herring
+(likely hit when no JWT was present, or when using a wrong scheme).
+
+Fix for bambu_api.py — change the BASE_URL line to:
+    BASE_URL = "https://192.168.68.78:8888"   # already correct
+and remove/ignore CUCKOO_PROXY.  The existing _post() will work as-is.
+
+Also check: is CUCKOO_PROXY = None in bambu_api.py?  If so it already
+passes proxies=None to requests and should work immediately.
+""")
+        return
+
+    print("\n    Direct https failed. Trying PowerShell with cert store ...")
+    print(f"\n[3] Listing certs in CurrentUser\\My ...")
     certs = list_user_certs()
     if not certs:
-        print("    (none found or PowerShell failed)")
-    for c in certs:
-        flag = "  <-- BAMBU?" if c in find_bambu_certs(certs) else ""
-        print(f"    {c['Thumbprint'][:16]}...  {c['Subject'][:55]}  exp {c['NotAfter']}{flag}")
-
-    bambu_certs = find_bambu_certs(certs)
-    if not bambu_certs and certs:
-        print("\n    No cert with 'bambu/bbl/farm' in subject/issuer.")
-        print("    Will test ALL certs with a private key.")
-        candidates = [c for c in certs if c.get("HasPrivKey")]
+        print("    No certs found.")
     else:
-        candidates = bambu_certs
+        for c in certs:
+            print(f"    {c['Thumbprint'][:20]}...  {c['Subject'][:55]}  exp {c['NotAfter']}"
+                  f"  privkey={c.get('HasPrivKey')}")
 
-    print(f"\n[2] Sniffing JWT from client ...")
-    jwt = sniff_jwt()
-    print(f"    JWT sniffed: {'yes (' + jwt[:20] + '...)' if jwt else 'no (timed out)'}")
-
-    print(f"\n[3] Testing PowerShell route with {len(candidates)} candidate cert(s) ...")
-    url = f"{API_URL}{PROBE_PATH}"
-    winner = None
+    candidates = [c for c in certs if c.get("HasPrivKey")]
+    print(f"\n[4] Testing PowerShell route with {len(candidates)} cert(s) ...")
+    url = f"{API_BASE}{PROBE_PATH}"
+    ps_winner = None
     for c in candidates:
         thumb = c["Thumbprint"]
-        print(f"\n    cert: {thumb[:16]}...  {c['Subject'][:55]}")
+        print(f"\n    cert: ...{thumb[-16:]}  {c['Subject'][:55]}")
         result = ps_get(url, thumb, jwt)
-        print(f"    result: {result[:200]}")
-        if result and "ERROR" not in result and "TIMEOUT" not in result and "error" not in result.lower():
-            winner = (thumb, c["Subject"])
+        print(f"    result: {result[:300]}")
+        if result and "ERROR" not in result and "TIMEOUT" not in result:
+            ps_winner = (thumb, c["Subject"])
+            break
 
     print("\n" + "=" * 70)
-    print("CONCLUSION")
+    print("RESULT")
     print("=" * 70)
-    if winner:
-        thumb, subject = winner
+    if ps_winner:
+        thumb, subject = ps_winner
         print(f"""
-    PowerShell route WORKS with cert thumbprint:
-        {thumb}  ({subject})
+    PowerShell Invoke-RestMethod works with thumbprint:
+        {thumb}
+    Subject: {subject}
 
-    This is the transport to use in bambu_api.py.
-    Copy the thumbprint above and report back — the code will be updated.
+    bambu_api.py will be updated to use subprocess + PowerShell for writes.
+    Paste this output back to get the updated code.
 """)
     else:
         print("""
-    PowerShell route did not succeed with any cert.
-
-    Possible next steps:
-      a) The Bambu cert is in LocalMachine\\My rather than CurrentUser\\My.
-         Re-run: Set-Location Cert:\\LocalMachine\\My and check.
-      b) The cert subject uses different keywords than bambu/bbl/farm.
-      c) Try driving the client via DevTools (Runtime.evaluate in main process).
-
-    Paste this full output back to proceed.
+    Neither direct https nor PowerShell with any cert worked.
+    Paste this full output back — next step is driving the client via DevTools.
 """)
 
 
