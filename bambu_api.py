@@ -2,8 +2,20 @@
 bambu_api.py - write layer for the Smokeforge print farm.
 
 Sniffs a JWT from the Farm Manager client's own requests (Authorization header
-via DevTools) and uses it to POST to the local server.  The cert is held by
-the client's cuckoo proxy; we POST through requests with verify=False.
+via DevTools) and uses it to issue write commands to the local server.
+
+TRANSPORT NOTE (important):
+    The server enforces mutual TLS.  A plain `requests` call to
+    https://192.168.68.78:8888 fails the handshake with
+    TLSV13_ALERT_CERTIFICATE_REQUIRED, because the server demands a client
+    cert we don't hold (non-exportable; see technical notes section 1).
+    `verify=False` does NOT help - it only disables OUR check of the server.
+
+    The client succeeds because its requests carry the cert via the internal
+    "cuckoo" proxy.  To write, we must reach the server the same way.  Run
+    investigate_cuckoo.py to discover cuckoo's local listen port, then set
+    CUCKOO_PROXY below; all writes will then inherit the cert automatically.
+    Until that is set, _post() raises a clear, actionable error.
 
 Usage:
     from bambu_api import post_task, opt_command
@@ -44,6 +56,12 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 BASE_URL = "https://192.168.68.78:8888"
 HEADERS_FIXED = {"x-bbl-sec-ver": "1"}
 JWT_MAX_AGE = 6 * 24 * 3600  # treat token as stale after 6 days
+
+# Set this once investigate_cuckoo.py reveals the local proxy that holds the
+# client cert, e.g. {"https": "http://127.0.0.1:<port>",
+#                    "http":  "http://127.0.0.1:<port>"}.
+# While None, writes raise a clear mTLS error rather than silently failing.
+CUCKOO_PROXY: dict | None = None
 
 _jwt_cache: dict = {}  # keys: "token", "captured_at"
 
@@ -125,12 +143,32 @@ def _get_jwt() -> str:
     return token
 
 
-def _session() -> tuple[requests.Session, dict]:
-    """Return a configured requests.Session and auth headers."""
+def _post(path: str, payload: dict) -> dict:
+    """
+    Single transport chokepoint for all writes.  Adds auth headers and sends
+    the request through cuckoo (if configured) so the client cert is applied.
+
+    Raises a clear, actionable error on the mTLS handshake failure that occurs
+    when no cuckoo route is configured.
+    """
     jwt = _get_jwt()
-    sess = requests.Session()
     headers = {**HEADERS_FIXED, "Authorization": f"Bearer {jwt}"}
-    return sess, headers
+    url = f"{BASE_URL}{path}"
+    try:
+        resp = requests.post(
+            url, json=payload, headers=headers,
+            proxies=CUCKOO_PROXY, verify=False, timeout=30,
+        )
+    except requests.exceptions.SSLError as e:
+        raise RuntimeError(
+            "Write failed at the TLS handshake - the server requires a client "
+            "certificate (mutual TLS) we are not presenting.\n"
+            "Direct requests cannot satisfy this. Run investigate_cuckoo.py to "
+            "find the client's cuckoo proxy port, then set CUCKOO_PROXY at the "
+            f"top of bambu_api.py.\nUnderlying error: {e}"
+        ) from e
+    resp.raise_for_status()
+    return resp.json()
 
 
 def post_task(
@@ -145,7 +183,6 @@ def post_task(
     ams_mapping: ordered list of {ams_id, slot_id} dicts, one per filament
     index in the model.  This becomes ams_mapping2 inside device_pool2.
     """
-    sess, headers = _session()
     payload = {
         "task_print_model": 1,
         "queue_model_cnt": 0,
@@ -165,9 +202,7 @@ def post_task(
         "f3mf_id": f3mf_id,
         "ams_mapping2": [],
     }
-    resp = sess.post(f"{BASE_URL}/task", json=payload, headers=headers, verify=False)
-    resp.raise_for_status()
-    return resp.json()
+    return _post("/task", payload)
 
 
 def opt_command(dev_id: str, opt_name: str) -> dict:
@@ -175,16 +210,7 @@ def opt_command(dev_id: str, opt_name: str) -> dict:
     Send a device opt command (pause / resume / stop / bed_clean / …).
     Wraps the name in the standard {"opt": "<name>"} envelope.
     """
-    sess, headers = _session()
-    payload = {"opt": opt_name}
-    resp = sess.post(
-        f"{BASE_URL}/device/{dev_id}/opt",
-        json=payload,
-        headers=headers,
-        verify=False,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    return _post(f"/device/{dev_id}/opt", {"opt": opt_name})
 
 
 if __name__ == "__main__":
