@@ -2,14 +2,18 @@
 investigate_cuckoo.py - figure out HOW the Farm Manager client reaches the
 server, so we can route our own write requests the same way.
 
-Background: direct Python requests to https://192.168.68.78:8888 fail mutual
-TLS (the server demands a client cert we don't have).  The client succeeds
-because its requests carry the cert via the internal "cuckoo" proxy.  To
-write, we must send our requests through whatever path the client uses.
+Background: a direct Python request to https://192.168.68.78:8888 fails mutual
+TLS (the server demands a client cert we don't have).  The client instead
+makes PLAIN http://192.168.68.78:8888 requests that Electron intercepts and
+routes through a local "cuckoo" proxy, which performs the real mTLS HTTPS to
+the server.  To write, we must send our requests through that same proxy.
 
-This script does NOT originate any HTTP.  It passively inspects a real API
-request the client already makes (via DevTools) and reports the connection
-facts, then enumerates local listeners and processes that might be cuckoo.
+What this script does:
+  [1] Passively inspects a real :8888 request the client makes (via DevTools).
+  [2] Lists local TCP listeners and maps each to its owning process.
+  [3] ACTIVELY probes each local port with a read-only GET /captain, routed
+      through that port as an HTTP proxy (and also tried directly), to find
+      which port is cuckoo.  /captain is the server health endpoint - safe.
 
 Run it on the Windows box with the client open on the Printers page:
     python investigate_cuckoo.py
@@ -30,7 +34,20 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "websocket-client"])
     import websocket
 
-API_HOST_HINT = "192.168.68.78"   # the server we ultimately want to reach
+try:
+    import requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except ImportError:
+    print("Installing requests ...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
+    import requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+API_HOST_HINT = "192.168.68.78"          # the server we ultimately want to reach
+API_HTTP = "http://192.168.68.78:8888"   # how the client addresses it
+PROBE_PATH = "/captain"                  # read-only health endpoint
 
 
 # ---------------------------------------------------------------------------
@@ -70,15 +87,15 @@ def inspect_api_request(timeout: int = 40) -> dict | None:
                 continue
             resp = msg["params"]["response"]
             url = resp.get("url", "")
-            # any call to the real API host/port (8888) tells us the path
             if ":8888" in url or API_HOST_HINT in url:
                 found = {
                     "url": url,
+                    "scheme": url.split(":", 1)[0],
                     "remoteIPAddress": resp.get("remoteIPAddress"),
                     "remotePort": resp.get("remotePort"),
                     "protocol": resp.get("protocol"),
-                    "requestHeaders": resp.get("requestHeaders", {}),
                     "fromProxy": resp.get("fromProxy"),
+                    "requestHeaders": resp.get("requestHeaders", {}),
                 }
     finally:
         ws.close()
@@ -87,31 +104,116 @@ def inspect_api_request(timeout: int = 40) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# 2. Enumerate local listeners + processes (Windows)
+# 2. Enumerate local listeners + map to processes (Windows)
 # ---------------------------------------------------------------------------
 
-def local_listeners() -> str:
+def name_for_pid(pid: str) -> str:
+    try:
+        out = subprocess.check_output(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            text=True, stderr=subprocess.DEVNULL)
+        parts = out.strip().split('","')
+        if parts and parts[0]:
+            return parts[0].strip('"')
+    except Exception:
+        pass
+    return "?"
+
+
+def local_listeners() -> list[tuple[str, str, str]]:
+    """Return [(port, pid, process_name), ...] for 127.0.0.1 TCP listeners."""
     try:
         out = subprocess.check_output(
             ["netstat", "-ano", "-p", "TCP"], text=True, stderr=subprocess.DEVNULL)
     except Exception as e:
-        return f"(netstat failed: {e})"
-    lines = [ln for ln in out.splitlines() if "LISTENING" in ln and "127.0.0.1" in ln]
-    return "\n".join(lines) if lines else "(no 127.0.0.1 TCP listeners found)"
-
-
-def find_cuckoo_processes() -> str:
-    try:
-        out = subprocess.check_output(["tasklist"], text=True, stderr=subprocess.DEVNULL)
-    except Exception as e:
-        return f"(tasklist failed: {e})"
-    hits = [ln for ln in out.splitlines()
-            if re.search(r"cuckoo|bambu", ln, re.IGNORECASE)]
-    return "\n".join(hits) if hits else "(no cuckoo/bambu processes matched)"
+        print(f"  (netstat failed: {e})")
+        return []
+    rows = []
+    seen = set()
+    for ln in out.splitlines():
+        if "LISTENING" not in ln or "127.0.0.1" not in ln:
+            continue
+        m = re.search(r"127\.0\.0\.1:(\d+)\s+\S+\s+LISTENING\s+(\d+)", ln)
+        if not m:
+            continue
+        port, pid = m.group(1), m.group(2)
+        if port in seen:
+            continue
+        seen.add(port)
+        rows.append((port, pid, name_for_pid(pid)))
+    return rows
 
 
 # ---------------------------------------------------------------------------
-# Report + interpretation
+# 3. Actively probe candidate ports for the cuckoo route
+# ---------------------------------------------------------------------------
+
+def _auth_headers() -> dict:
+    """Best-effort JWT for the probe (/captain may not need it, but be safe)."""
+    headers = {"x-bbl-sec-ver": "1"}
+    try:
+        from bambu_api import _get_jwt
+        headers["Authorization"] = f"Bearer {_get_jwt()}"
+    except Exception as e:
+        print(f"  (could not sniff a JWT for the probe: {e})")
+    return headers
+
+
+def _summarise(resp) -> str:
+    body = (resp.text or "")[:160].replace("\n", " ")
+    return f"HTTP {resp.status_code}  body[:160]={body!r}"
+
+
+def probe_ports(ports: list[str]) -> str | None:
+    """
+    For each candidate port, try reaching GET {API_HTTP}{PROBE_PATH} two ways:
+      a) using the port as an HTTP forward proxy
+      b) talking to the port directly (reverse-proxy style)
+    Return the first port that yields a healthy response, else None.
+    """
+    headers = _auth_headers()
+    winner = None
+
+    print(f"\n    Target: GET {API_HTTP}{PROBE_PATH}")
+    print("    (a) = port used as HTTP proxy   (b) = direct to 127.0.0.1:port\n")
+
+    for port in ports:
+        proxies = {"http": f"http://127.0.0.1:{port}",
+                   "https": f"http://127.0.0.1:{port}"}
+        # (a) as a forward proxy
+        try:
+            r = requests.get(f"{API_HTTP}{PROBE_PATH}", headers=headers,
+                             proxies=proxies, timeout=6, verify=False)
+            print(f"    port {port} (a) proxy : {_summarise(r)}")
+            if r.ok and r.text.strip().startswith(("{", "[")):
+                winner = winner or ("proxy", port)
+        except Exception as e:
+            print(f"    port {port} (a) proxy : {type(e).__name__}: {str(e)[:80]}")
+        # (b) direct to the port
+        try:
+            r = requests.get(f"http://127.0.0.1:{port}{PROBE_PATH}", headers=headers,
+                             timeout=6, verify=False)
+            print(f"    port {port} (b) direct: {_summarise(r)}")
+            if r.ok and r.text.strip().startswith(("{", "[")):
+                winner = winner or ("direct", port)
+        except Exception as e:
+            print(f"    port {port} (b) direct: {type(e).__name__}: {str(e)[:80]}")
+
+    # also a baseline: plain http straight to the server (no proxy)
+    try:
+        r = requests.get(f"{API_HTTP}{PROBE_PATH}", headers=headers,
+                         timeout=6, verify=False)
+        print(f"\n    baseline no-proxy http: {_summarise(r)}")
+        if r.ok and r.text.strip().startswith(("{", "[")):
+            winner = winner or ("noproxy-http", "-")
+    except Exception as e:
+        print(f"\n    baseline no-proxy http: {type(e).__name__}: {str(e)[:80]}")
+
+    return winner
+
+
+# ---------------------------------------------------------------------------
+# Report
 # ---------------------------------------------------------------------------
 
 def main():
@@ -123,59 +225,60 @@ def main():
     info = inspect_api_request()
     if not info:
         print("    No :8888 API request observed. Make sure the client is open")
-        print("    on the Printers page (it polls /devices2 every ~30s).")
-    else:
-        print(f"    url            : {info['url']}")
-        print(f"    remoteIPAddress: {info['remoteIPAddress']}")
-        print(f"    remotePort     : {info['remotePort']}")
-        print(f"    protocol       : {info['protocol']}")
-        print(f"    fromProxy      : {info['fromProxy']}")
-        hdrs = info["requestHeaders"]
-        interesting = {k: v for k, v in hdrs.items()
-                       if k.lower() in ("host", "authorization", "x-bbl-sec-ver",
-                                        "user-agent", "via", "x-forwarded-for")}
-        print(f"    key headers    : {json.dumps(interesting, indent=22)[22:]}")
+        print("    on the Printers page (it polls every ~30s). Stopping.")
+        return
+    print(f"    url            : {info['url']}")
+    print(f"    scheme         : {info['scheme']}")
+    print(f"    remoteIPAddress: {info['remoteIPAddress']}")
+    print(f"    remotePort     : {info['remotePort']}")
+    print(f"    protocol       : {info['protocol']}")
+    print(f"    fromProxy      : {info['fromProxy']}")
 
-    print("\n[2] Local TCP listeners on 127.0.0.1 (cuckoo proxy candidates):")
-    print(local_listeners())
+    print("\n[2] Local TCP listeners on 127.0.0.1:")
+    listeners = local_listeners()
+    for port, pid, name in listeners:
+        print(f"    127.0.0.1:{port:<6}  pid {pid:<6}  {name}")
 
-    print("\n[3] Processes matching cuckoo/bambu:")
-    print(find_cuckoo_processes())
+    print("\n[3] Probing candidate ports for the cuckoo route ...")
+    ports = [p for p, _, _ in listeners if p != "9222"]  # skip the debug port
+    winner = probe_ports(ports)
 
     print("\n" + "=" * 70)
-    print("HOW TO READ THIS")
+    print("CONCLUSION")
     print("=" * 70)
-    if info and info.get("remoteIPAddress"):
-        ip = info["remoteIPAddress"]
-        if ip.startswith("127.") or ip == "::1":
+    if winner:
+        mode, port = winner
+        if mode == "proxy":
             print(f"""
-    remoteIPAddress is LOCALHOST ({ip}:{info['remotePort']}).
-    => cuckoo is a real local proxy. The client sends to it, and it
-       re-originates to the server WITH the client cert.
+    Cuckoo is the HTTP proxy on 127.0.0.1:{port}.
+    Set this at the top of bambu_api.py and writes will work:
 
-    NEXT STEP: route our writes through it. In bambu_api.py set:
-        CUCKOO_PROXY = {{"https": "http://127.0.0.1:{info['remotePort']}",
-                        "http":  "http://127.0.0.1:{info['remotePort']}"}}
-    (or, if it speaks plain HTTP, point BASE_URL at
-     http://127.0.0.1:{info['remotePort']}). Then post_task / opt_command
-     will inherit the cert automatically.""")
-        else:
+        CUCKOO_PROXY = {{"http":  "http://127.0.0.1:{port}",
+                        "https": "http://127.0.0.1:{port}"}}
+        BASE_URL = "http://192.168.68.78:8888"   # note: http, like the client
+""")
+        elif mode == "direct":
             print(f"""
-    remoteIPAddress is the REAL SERVER ({ip}:{info['remotePort']}).
-    => there is no local proxy hop. Electron's network stack is presenting
-       the client cert directly from the Windows cert store.
+    The server is reachable directly at 127.0.0.1:{port} (reverse proxy).
+    Set this at the top of bambu_api.py:
 
-    This means a forward-proxy route does NOT exist; the cert is attached
-    by the OS/Electron net layer. Options from here:
-      * shell out to Windows curl (Schannel) referencing the cert by
-        thumbprint (CurrentUser\\MY\\<thumb>) - uses the non-exportable key
-        without exporting it; or
-      * drive the client via DevTools so the app issues the request.
-    Re-run with this output and we'll pick the route.""")
+        BASE_URL = "http://127.0.0.1:{port}"
+        CUCKOO_PROXY = None
+""")
+        else:  # noproxy-http
+            print(f"""
+    Plain HTTP straight to {API_HTTP} works (no proxy needed)!
+    Set at the top of bambu_api.py:
+
+        BASE_URL = "http://192.168.68.78:8888"   # http, not https
+        CUCKOO_PROXY = None
+""")
     else:
-        print("\n    No API request captured - cannot conclude. Retry with the")
-        print("    client focused on the Printers page.")
-    print()
+        print("""
+    None of the probed ports returned a healthy /captain.  Paste this whole
+    output back and we'll pick the next approach (Windows curl via cert
+    thumbprint, or driving the client through DevTools).
+""")
 
 
 if __name__ == "__main__":
