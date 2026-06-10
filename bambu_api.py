@@ -2,20 +2,12 @@
 bambu_api.py - write layer for the Smokeforge print farm.
 
 Sniffs a JWT from the Farm Manager client's own requests (Authorization header
-via DevTools) and uses it to issue write commands to the local server.
+via DevTools — same passive-capture pattern as bambu_filament.py), caches it,
+and uses it to POST write commands to the local server.
 
-TRANSPORT NOTE (important):
-    The server enforces mutual TLS.  A plain `requests` call to
-    https://192.168.68.78:8888 fails the handshake with
-    TLSV13_ALERT_CERTIFICATE_REQUIRED, because the server demands a client
-    cert we don't hold (non-exportable; see technical notes section 1).
-    `verify=False` does NOT help - it only disables OUR check of the server.
-
-    The client succeeds because its requests carry the cert via the internal
-    "cuckoo" proxy.  To write, we must reach the server the same way.  Run
-    investigate_cuckoo.py to discover cuckoo's local listen port, then set
-    CUCKOO_PROXY below; all writes will then inherit the cert automatically.
-    Until that is set, _post() raises a clear, actionable error.
+Connection method: ensure_client() launches the Electron client with debug
+flags if needed; all data access is via the Chrome DevTools Protocol on
+port 9222.  No certificates, no direct TLS, no activation risk.
 
 Usage:
     from bambu_api import post_task, opt_command
@@ -33,7 +25,6 @@ import time
 
 
 def _ensure_deps():
-    # package name -> import name (where they differ)
     deps = {"requests": "requests", "urllib3": "urllib3", "websocket-client": "websocket"}
     for pkg, imp in deps.items():
         try:
@@ -55,21 +46,20 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BASE_URL = "https://192.168.68.78:8888"
 HEADERS_FIXED = {"x-bbl-sec-ver": "1"}
-JWT_MAX_AGE = 6 * 24 * 3600  # treat token as stale after 6 days
-
-# Set this once investigate_cuckoo.py reveals the local proxy that holds the
-# client cert, e.g. {"https": "http://127.0.0.1:<port>",
-#                    "http":  "http://127.0.0.1:<port>"}.
-# While None, writes raise a clear mTLS error rather than silently failing.
-CUCKOO_PROXY: dict | None = None
+JWT_MAX_AGE = 6 * 24 * 3600  # sniffed JWTs expire ~7 days; re-sniff after 6
 
 _jwt_cache: dict = {}  # keys: "token", "captured_at"
 
 
-def _sniff_jwt(timeout: int = 20) -> str | None:
+# ---------------------------------------------------------------------------
+# JWT — sniff from the client's own requests via DevTools
+# ---------------------------------------------------------------------------
+
+def _sniff_jwt(timeout: int = 35) -> str | None:
     """
     Open a DevTools session and wait for any request that carries an
-    Authorization: Bearer header.  Returns the token string or None.
+    Authorization: Bearer header.  The client polls every ~30 s so 35 s
+    is enough to reliably catch at least one cycle.
     """
     ws_url = get_page_ws()
     if not ws_url:
@@ -83,9 +73,6 @@ def _sniff_jwt(timeout: int = 20) -> str | None:
         ws.send(json.dumps({"id": mid[0], "method": method, "params": params or {}}))
 
     send("Network.enable")
-    # Also ask for request headers to be captured
-    send("Network.setRequestInterception", {"patterns": []})
-
     ws.settimeout(timeout + 2)
     deadline = time.time() + timeout
     token = None
@@ -97,28 +84,15 @@ def _sniff_jwt(timeout: int = 20) -> str | None:
             except Exception:
                 break
             method = msg.get("method", "")
-            # responseReceived carries the request headers too
-            if method == "Network.responseReceived":
-                req_headers = (
-                    msg.get("params", {})
-                    .get("response", {})
-                    .get("requestHeaders", {})
-                )
-                auth = req_headers.get("Authorization") or req_headers.get("authorization")
-                if auth and auth.startswith("Bearer "):
-                    token = auth[len("Bearer "):]
-                    break
-            # requestWillBeSent also contains request headers
-            elif method == "Network.requestWillBeSent":
-                req_headers = (
-                    msg.get("params", {})
-                    .get("request", {})
-                    .get("headers", {})
-                )
-                auth = req_headers.get("Authorization") or req_headers.get("authorization")
-                if auth and auth.startswith("Bearer "):
-                    token = auth[len("Bearer "):]
-                    break
+            if method == "Network.requestWillBeSent":
+                hdrs = msg.get("params", {}).get("request", {}).get("headers", {})
+            elif method == "Network.responseReceived":
+                hdrs = msg.get("params", {}).get("response", {}).get("requestHeaders", {})
+            else:
+                continue
+            auth = hdrs.get("Authorization") or hdrs.get("authorization", "")
+            if auth.startswith("Bearer "):
+                token = auth[len("Bearer "):]
     finally:
         ws.close()
 
@@ -126,7 +100,7 @@ def _sniff_jwt(timeout: int = 20) -> str | None:
 
 
 def _get_jwt() -> str:
-    """Return a valid JWT, re-sniffing if cache is empty or stale."""
+    """Return a cached JWT, re-sniffing if absent or older than 6 days."""
     now = time.time()
     if _jwt_cache.get("token") and (now - _jwt_cache.get("captured_at", 0)) < JWT_MAX_AGE:
         return _jwt_cache["token"]
@@ -135,61 +109,41 @@ def _get_jwt() -> str:
     token = _sniff_jwt()
     if not token:
         raise RuntimeError(
-            "Could not capture a JWT from the Farm Manager client. "
-            "Ensure the client is open and making requests."
+            "Could not capture a JWT. "
+            "Ensure the Farm Manager client is open on the Printers page."
         )
     _jwt_cache["token"] = token
     _jwt_cache["captured_at"] = now
     return token
 
 
-def _post(path: str, payload: dict) -> dict:
-    """
-    Single transport chokepoint for all writes.  Adds auth headers and sends
-    the request through cuckoo (if configured) so the client cert is applied.
+# ---------------------------------------------------------------------------
+# Write commands
+# ---------------------------------------------------------------------------
 
-    Raises a clear, actionable error on the mTLS handshake failure that occurs
-    when no cuckoo route is configured.
-    """
+def _post(path: str, payload: dict) -> dict:
     jwt = _get_jwt()
     headers = {**HEADERS_FIXED, "Authorization": f"Bearer {jwt}"}
-    url = f"{BASE_URL}{path}"
-    try:
-        resp = requests.post(
-            url, json=payload, headers=headers,
-            proxies=CUCKOO_PROXY, verify=False, timeout=30,
-        )
-    except requests.exceptions.SSLError as e:
-        raise RuntimeError(
-            "Write failed at the TLS handshake - the server requires a client "
-            "certificate (mutual TLS) we are not presenting.\n"
-            "Direct requests cannot satisfy this. Run investigate_cuckoo.py to "
-            "find the client's cuckoo proxy port, then set CUCKOO_PROXY at the "
-            f"top of bambu_api.py.\nUnderlying error: {e}"
-        ) from e
+    sess = requests.Session()
+    resp = sess.post(f"{BASE_URL}{path}", json=payload, headers=headers,
+                     verify=False, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 
-def post_task(
-    dev_id: str,
-    f3mf_id: str,
-    task_name: str,
-    ams_mapping: list[dict],
-) -> dict:
+def post_task(dev_id: str, f3mf_id: str, task_name: str,
+              ams_mapping: list[dict]) -> dict:
     """
     Create a print job.
 
     ams_mapping: ordered list of {ams_id, slot_id} dicts, one per filament
-    index in the model.  This becomes ams_mapping2 inside device_pool2.
+    index in the model (becomes ams_mapping2 inside device_pool2).
     """
     payload = {
         "task_print_model": 1,
         "queue_model_cnt": 0,
         "device_pool": [dev_id],
-        "device_pool2": [
-            {"dev_id": dev_id, "ams_mapping2": ams_mapping}
-        ],
+        "device_pool2": [{"dev_id": dev_id, "ams_mapping2": ams_mapping}],
         "task_name": task_name,
         "print_option": {
             "auto_bed_leveling": True,
@@ -207,11 +161,14 @@ def post_task(
 
 def opt_command(dev_id: str, opt_name: str) -> dict:
     """
-    Send a device opt command (pause / resume / stop / bed_clean / …).
-    Wraps the name in the standard {"opt": "<name>"} envelope.
+    Send a device opt command — pause / resume / stop / bed_clean / …
     """
     return _post(f"/device/{dev_id}/opt", {"opt": opt_name})
 
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     args = sys.argv[1:]
