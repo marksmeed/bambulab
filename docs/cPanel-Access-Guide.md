@@ -45,7 +45,9 @@ WHM is the admin panel used to create accounts, manage hosting, and configure th
 
 4. Log in with:
    - **Username:** `root`
-   - **Password:** *(provided separately by your system administrator)*
+   - **Password:** `TdaProd9kWx2mQ4vL!`
+
+> **Important:** Change this password after your first login via WHM → Server Configuration → Change Root Password.
 
 ---
 
