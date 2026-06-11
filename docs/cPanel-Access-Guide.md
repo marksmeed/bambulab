@@ -4,8 +4,8 @@
 
 | Environment | IP Address | Purpose |
 |-------------|------------|---------|
-| **Production** | `35.179.31.248` | Live site |
-| **Staging / Dev** | `18.171.26.241` | Testing and development |
+| **Production** | `13.135.200.253` | Live site (EC2 `i-0c4fb39f766dfc80d`) |
+| **Staging / Dev** | `16.61.86.201` | Testing and development (EC2 `i-000d9f6aa6d1bbe5c`) |
 
 ### Database Endpoints (RDS)
 
@@ -33,12 +33,12 @@ WHM is the admin panel used to create accounts, manage hosting, and configure th
 
    **Production:**
    ```
-   https://35.179.31.248:2087
+   https://13.135.200.253:2087
    ```
 
    **Staging:**
    ```
-   https://18.171.26.241:2087
+   https://16.61.86.201:2087
    ```
 
 3. Your browser may show a security warning ("Your connection is not private"). This is normal at this stage — click **Advanced** then **Proceed** (or **Accept the risk and continue** in Firefox).
@@ -62,12 +62,12 @@ cPanel is the control panel for an individual hosting account. Each Joomla site 
 
    **Production:**
    ```
-   https://35.179.31.248:2083
+   https://13.135.200.253:2083
    ```
 
    **Staging:**
    ```
-   https://18.171.26.241:2083
+   https://16.61.86.201:2083
    ```
 
 3. Accept the browser security warning as above.
@@ -157,4 +157,4 @@ Useful when you need to manage an account but don't know the password.
 
 ---
 
-*Last updated: June 2026 | Environment: AWS Lightsail eu-west-2 (London)*
+*Last updated: June 2026 | Environment: AWS EC2 CloudLinux 10, eu-west-2 (London)*
