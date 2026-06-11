@@ -7,6 +7,17 @@
 | **Production** | `35.179.31.248` | Live site |
 | **Staging / Dev** | `18.171.26.241` | Testing and development |
 
+### Database Endpoints (RDS)
+
+These are the database server addresses used by Joomla. You will need these when configuring Joomla or connecting a database tool.
+
+| Environment | Database Host | Database Name | Username |
+|-------------|--------------|---------------|----------|
+| **Production** | `tda-rds-prod.cbi6gciei7yc.eu-west-2.rds.amazonaws.com` | `joomla` | `joomla_admin` |
+| **Staging** | `tda-rds-staging.cbi6gciei7yc.eu-west-2.rds.amazonaws.com` | `joomla` | `joomla_admin` |
+
+> The database password is held securely by your system administrator. Do not store it in plain text.
+
 ---
 
 ## How to Access WHM (Web Host Manager)
