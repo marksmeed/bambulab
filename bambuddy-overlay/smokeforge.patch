@@ -1,0 +1,147 @@
+diff --git a/backend/app/models/__init__.py b/backend/app/models/__init__.py
+index 9839776d..8ad74505 100644
+--- a/backend/app/models/__init__.py
++++ b/backend/app/models/__init__.py
+@@ -33,6 +33,9 @@ from backend.app.models.user import User
+ from backend.app.models.user_email_pref import UserEmailPreference
+ from backend.app.models.user_otp_code import UserOTPCode
+ from backend.app.models.user_totp import UserTOTP
++from backend.app.models.product import Product, ProductPart
++from backend.app.models.order import Order, OrderItem, OrderPartColour
++from backend.app.models.fulfilment_job import FulfilmentJob, FulfilmentJobFilament
+ 
+ __all__ = [
+     "Printer",
+@@ -77,4 +80,11 @@ __all__ = [
+     "AuthEphemeralToken",
+     "AuthRateLimitEvent",
+     "LongLivedToken",
++    "Product",
++    "ProductPart",
++    "Order",
++    "OrderItem",
++    "OrderPartColour",
++    "FulfilmentJob",
++    "FulfilmentJobFilament",
+ ]
+diff --git a/frontend/src/App.tsx b/frontend/src/App.tsx
+index bc1477d0..12406077 100644
+--- a/frontend/src/App.tsx
++++ b/frontend/src/App.tsx
+@@ -37,6 +37,7 @@ import { SpoolBuddyAmsPage } from './pages/spoolbuddy/SpoolBuddyAmsPage';
+ import { SpoolBuddySettingsPage } from './pages/spoolbuddy/SpoolBuddySettingsPage';
+ import { SpoolBuddyCalibrationPage } from './pages/spoolbuddy/SpoolBuddyCalibrationPage';
+ import { SpoolBuddyWriteTagPage } from './pages/spoolbuddy/SpoolBuddyWriteTagPage';
++import { OrdersPage } from './pages/OrdersPage';
+ import { SpoolBuddyInventoryPage } from './pages/spoolbuddy/SpoolBuddyInventoryPage';
+ class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null; errorInfo: ErrorInfo | null }> {
+   state = { error: null as Error | null, errorInfo: null as ErrorInfo | null };
+@@ -214,6 +215,7 @@ function App() {
+                   <Route path="gcode-viewer" element={<GCodeViewerPage />} />
+                   <Route path="external/:id" element={<ExternalLinkPage />} />
+                   <Route path="camera-tokens" element={<Navigate to="/settings?tab=apikeys#card-camera-tokens" replace />} />
++                  <Route path="orders" element={<OrdersPage />} />
+                 </Route>
+               </Routes>
+             </BrowserRouter>
+diff --git a/frontend/src/components/Layout.tsx b/frontend/src/components/Layout.tsx
+index bde7a53c..a4c4b5ee 100644
+--- a/frontend/src/components/Layout.tsx
++++ b/frontend/src/components/Layout.tsx
+@@ -1,6 +1,6 @@
+ import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+ import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom';
+-import { Printer, Archive, ListOrdered, BarChart3, Cloud, Settings, Sun, Moon, Monitor, ChevronLeft, ChevronRight, Keyboard, Github, GripVertical, ArrowUpCircle, Wrench, FolderKanban, FolderOpen, X, Menu, Info, Plug, Bug, LogOut, Key, Loader2, Disc3, ShieldAlert, Bell, Globe, type LucideIcon } from 'lucide-react';
++import { Printer, Archive, ListOrdered, BarChart3, Cloud, Settings, Sun, Moon, Monitor, ChevronLeft, ChevronRight, Keyboard, Github, GripVertical, ArrowUpCircle, Wrench, FolderKanban, FolderOpen, X, Menu, Info, Plug, Bug, LogOut, Key, Loader2, Disc3, ShieldAlert, Bell, Globe, ShoppingCart, type LucideIcon } from 'lucide-react';
+ import { useTranslation } from 'react-i18next';
+ import { useTheme } from '../contexts/ThemeContext';
+ import { KeyboardShortcutsModal } from './KeyboardShortcutsModal';
+@@ -31,6 +31,7 @@ export const defaultNavItems: NavItem[] = [
+   { id: 'inventory', to: '/inventory', icon: Disc3, labelKey: 'nav.inventory' },
+   { id: 'archives', to: '/archives', icon: Archive, labelKey: 'nav.archives' },
+   { id: 'queue', to: '/queue', icon: ListOrdered, labelKey: 'nav.queue' },
++  { id: 'orders', to: '/orders', icon: ShoppingCart, labelKey: 'nav.orders' },
+   { id: 'projects', to: '/projects', icon: FolderKanban, labelKey: 'nav.projects' },
+   { id: 'files', to: '/files', icon: FolderOpen, labelKey: 'nav.files' },
+   { id: 'makerworld', to: '/makerworld', icon: Globe, labelKey: 'nav.makerworld' },
+diff --git a/frontend/src/i18n/locales/en.ts b/frontend/src/i18n/locales/en.ts
+index 3c49eeb5..b6a68d9a 100644
+--- a/frontend/src/i18n/locales/en.ts
++++ b/frontend/src/i18n/locales/en.ts
+@@ -3,6 +3,7 @@ export default {
+   nav: {
+     printers: 'Printers',
+     archives: 'Archives',
++    orders: 'Orders',
+     queue: 'Print Queue',
+     stats: 'Statistics',
+     profiles: 'Profiles',
+@@ -1444,7 +1445,8 @@ export default {
+       general: 'General',
+       smartPlugs: 'Smart Plugs',
+       notifications: 'Notifications',
+-      queue: 'Workflow',
++      orders: 'Orders',
++    queue: 'Workflow',
+       filament: 'Filament',
+       network: 'Network',
+       apiKeys: 'API Keys',
+@@ -4510,7 +4512,8 @@ export default {
+       archiveDesc: 'Archive files immediately',
+       review: 'Review',
+       reviewDesc: 'Review before archiving',
+-      queue: 'Queue',
++      orders: 'Orders',
++    queue: 'Queue',
+       queueDesc: 'Archive and add to queue',
+       proxy: 'Proxy',
+       proxyDesc: 'Relay to real printer',
+diff --git a/backend/app/core/database.py b/backend/app/core/database.py
+index 476835d2..7191ef1a 100644
+--- a/backend/app/core/database.py
++++ b/backend/app/core/database.py
+@@ -212,6 +212,10 @@ async def init_db():
+         user_otp_code,
+         user_totp,
+         virtual_printer,
++        # Smokeforge fulfilment layer
++        product,
++        order,
++        fulfilment_job,
+     )
+ 
+     async with engine.begin() as conn:
+@@ -2914,6 +2918,13 @@ async def run_migrations(conn):
+     # file metadata so the FileManager displays the filename, not the title (#1489).
+     await _migrate_drop_library_print_name(conn)
+ 
++    # Smokeforge fulfilment tables — created by create_all(), no ALTER needed.
++    # Index creation is idempotent via IF NOT EXISTS.
++    await _safe_execute(conn, "CREATE INDEX IF NOT EXISTS ix_sf_orders_status ON sf_orders(status)")
++    await _safe_execute(conn, "CREATE INDEX IF NOT EXISTS ix_sf_orders_marketplace ON sf_orders(marketplace)")
++    await _safe_execute(conn, "CREATE INDEX IF NOT EXISTS ix_sf_order_items_status ON sf_order_items(status)")
++    await _safe_execute(conn, "CREATE INDEX IF NOT EXISTS ix_sf_jobs_state ON sf_fulfilment_jobs(state)")
++
+ 
+ async def seed_notification_templates():
+     """Seed default notification templates if they don't exist."""
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 27a2bbec..59e09933 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -68,6 +68,7 @@ from backend.app.api.routes import (
+     webhook,
+     websocket,
+ )
++from backend.app.api.routes import orders as orders_routes
+ from backend.app.api.routes.maintenance import _get_printer_maintenance_internal, ensure_default_types
+ from backend.app.api.routes.support import init_debug_logging
+ from backend.app.core.config import APP_VERSION, settings as app_settings
+@@ -6093,6 +6094,7 @@ app.include_router(obico.router, prefix=app_settings.api_prefix)
+ app.include_router(metrics.router, prefix=app_settings.api_prefix)
+ app.include_router(virtual_printers.router, prefix=app_settings.api_prefix)
+ app.include_router(spoolbuddy.router, prefix=app_settings.api_prefix)
++app.include_router(orders_routes.router, prefix=app_settings.api_prefix)
+ 
+ 
+ # Serve static files (React build)
